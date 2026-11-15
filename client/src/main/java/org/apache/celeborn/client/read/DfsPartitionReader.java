@@ -56,9 +56,12 @@ import org.apache.celeborn.common.util.Utils;
 
 public class DfsPartitionReader implements PartitionReader {
   private static Logger logger = LoggerFactory.getLogger(DfsPartitionReader.class);
+  private static final long MAX_RETRY_WAIT_MS = 60000L;
   private CelebornConf conf;
   PartitionLocation location;
   private final long shuffleChunkSize;
+  private final int dfsReadMaxRetries;
+  private final long dfsReadRetryWaitMs;
   private final int fetchMaxReqsInFlight;
   private final LinkedBlockingQueue<Pair<Integer, ByteBuf>> results;
   private final AtomicReference<Exception> exception = new AtomicReference<>();
@@ -98,6 +101,8 @@ public class DfsPartitionReader implements PartitionReader {
       throws IOException {
     this.conf = conf;
     shuffleChunkSize = conf.dfsReadChunkSize();
+    dfsReadMaxRetries = conf.dfsReadMaxRetries();
+    dfsReadRetryWaitMs = conf.dfsReadRetryWaitMs();
     fetchMaxReqsInFlight = conf.clientFetchMaxReqsInFlight();
     results = new LinkedBlockingQueue<>();
 
@@ -264,23 +269,7 @@ public class DfsPartitionReader implements PartitionReader {
                 long length = chunkOffsets.get(currentChunkIndex + 1) - offset;
                 logger.debug("read {} offset {} length {}", currentChunkIndex, offset, length);
                 byte[] buffer = new byte[(int) length];
-                try {
-                  dfsInputStream.readFully(offset, buffer);
-                } catch (IOException e) {
-                  logger.warn("read DFS {} failed will retry, error detail {}", dataFilePath, e);
-                  try {
-                    dfsInputStream.close();
-                    dfsInputStream = hadoopFs.open(dataFilePath);
-                    dfsInputStream.readFully(offset, buffer);
-                  } catch (IOException ex) {
-                    logger.warn(
-                        "retry read DFS {} failed, error detail {} ",
-                        location.getStorageInfo().getFilePath(),
-                        e);
-                    exception.set(ex);
-                    break;
-                  }
-                }
+                readChunk(offset, buffer);
                 results.put(Pair.of(currentChunkIndex, Unpooled.wrappedBuffer(buffer)));
                 logger.debug("add index {} to results", currentChunkIndex++);
               }
@@ -342,6 +331,71 @@ public class DfsPartitionReader implements PartitionReader {
     Exception e = exception.get();
     if (e != null) {
       throw e;
+    }
+  }
+
+  // Reads a whole chunk with resumable retries. When a read fails, the stream is
+  // reopened and reading resumes from the first byte that has not been read yet,
+  // so only the missing part of the chunk is refetched from remote storage.
+  private void readChunk(long offset, byte[] buffer) throws IOException, InterruptedException {
+    int bytesRead = 0;
+    int retries = 0;
+    while (bytesRead < buffer.length) {
+      try {
+        int read =
+            dfsInputStream.read(offset + bytesRead, buffer, bytesRead, buffer.length - bytesRead);
+        if (read < 0) {
+          throw new IOException(
+              "Unexpected EOF reading "
+                  + dataFilePath
+                  + " at offset "
+                  + (offset + bytesRead)
+                  + ", expected "
+                  + buffer.length
+                  + " bytes for the chunk");
+        }
+        bytesRead += read;
+        retries = 0;
+      } catch (IOException e) {
+        if (retries >= dfsReadMaxRetries) {
+          logger.error(
+              "Read DFS {} failed after {} retries, error detail {}", dataFilePath, retries, e);
+          throw e;
+        }
+        retries++;
+        long waitMs =
+            Math.min(
+                Math.min(dfsReadRetryWaitMs, MAX_RETRY_WAIT_MS) << Math.min(retries - 1, 10),
+                MAX_RETRY_WAIT_MS);
+        logger.warn(
+            "Read DFS {} failed (attempt {}/{}), {} of {} bytes already read,"
+                + " will resume from offset {} after {}ms, error detail {}",
+            dataFilePath,
+            retries,
+            dfsReadMaxRetries,
+            bytesRead,
+            buffer.length,
+            offset + bytesRead,
+            waitMs,
+            e);
+        reopenDfsInputStream();
+        Thread.sleep(waitMs);
+      }
+    }
+  }
+
+  private void reopenDfsInputStream() {
+    try {
+      dfsInputStream.close();
+    } catch (IOException e) {
+      logger.warn("Close DFS input stream {} failed.", dataFilePath, e);
+    }
+    try {
+      dfsInputStream = hadoopFs.open(dataFilePath);
+    } catch (IOException e) {
+      // Leave the stale stream in place so the next read attempt fails and is
+      // counted as another retry instead of aborting the whole partition read.
+      logger.warn("Reopen DFS input stream {} failed, will retry reading.", dataFilePath, e);
     }
   }
 

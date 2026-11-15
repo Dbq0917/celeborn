@@ -1188,6 +1188,8 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def shuffleManagerPort: Int = get(CLIENT_SHUFFLE_MANAGER_PORT)
   def shuffleChunkSize: Long = get(SHUFFLE_CHUNK_SIZE)
   def dfsReadChunkSize: Long = get(CLIENT_FETCH_DFS_READ_CHUNK_SIZE)
+  def dfsReadMaxRetries: Int = get(CLIENT_FETCH_DFS_READ_MAX_RETRIES)
+  def dfsReadRetryWaitMs: Long = get(CLIENT_FETCH_DFS_READ_RETRY_WAIT)
   def shufflePartitionSplitMode: PartitionSplitMode =
     PartitionSplitMode.valueOf(get(SHUFFLE_PARTITION_SPLIT_MODE))
   def shufflePartitionSplitThreshold: Long = get(SHUFFLE_PARTITION_SPLIT_THRESHOLD)
@@ -3410,6 +3412,28 @@ object CelebornConf extends Logging {
       .doc("Max chunk size for DfsPartitionReader.")
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("8m")
+
+  val CLIENT_FETCH_DFS_READ_MAX_RETRIES: ConfigEntry[Int] =
+    buildConf("celeborn.client.fetch.dfsReadMaxRetries")
+      .categories("client")
+      .version("0.7.0")
+      .doc("Max number of consecutive failed attempts DfsPartitionReader tolerates when " +
+        "reading a chunk from remote storage before giving up. Whenever an attempt fails, " +
+        "the reader reopens the input stream and resumes reading from the first byte that " +
+        "has not been read yet, so only the missing part of the chunk is refetched. " +
+        "The counter resets once any read makes progress.")
+      .intConf
+      .createWithDefault(10)
+
+  val CLIENT_FETCH_DFS_READ_RETRY_WAIT: ConfigEntry[Long] =
+    buildConf("celeborn.client.fetch.dfsReadRetryWait")
+      .categories("client")
+      .version("0.7.0")
+      .doc("Time that DfsPartitionReader waits before retrying a failed read from remote " +
+        "storage. The wait grows exponentially with the number of consecutive failures and " +
+        "is capped at one minute.")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .createWithDefaultString("5s")
 
   val WORKER_PARTITION_SPLIT_ENABLED: ConfigEntry[Boolean] =
     buildConf("celeborn.worker.shuffle.partitionSplit.enabled")
